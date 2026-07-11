@@ -1,2 +1,2 @@
 # Sistem-Temizlik
-Sistem temizleme
+İsmaTeknoloji performans arttırıcı ve viris temizleme sistemi
