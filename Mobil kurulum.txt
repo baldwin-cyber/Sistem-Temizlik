@@ -1,0 +1,12 @@
+önce cihazınızına gerek uygulamayı termux'u kurun play storede mevcut 
+ardından gereken paketleri indirin
+
+pkg install curl openssl-tool net-tools -y
+
+paketi indirdikten sonra yetki verin
+
+chmod +x guvenlik_tarama.sh
+
+ardından çalıştırın
+
+./guvenlik_tarama.sh
