@@ -1,0 +1,181 @@
+<#
+  GuvenlikTarama.ps1
+  Windows bilgisayar/sunucu sertlestirme + web sitesi genel guvenlik kontrolu
+  Yalnizca KENDI sisteminiz ve KENDI web siteniz icin kullanin.
+  Yonetici (Administrator) olarak calistirilmalidir.
+#>
+
+param(
+    [string]$WebSiteUrl = "",      # Ornek: https://siteniz.com
+    [switch]$AutoFix = $false      # Riskli ayarlari otomatik duzeltmek icin -AutoFix ekleyin
+)
+
+$ErrorActionPreference = "SilentlyContinue"
+$rapor = @()
+$tarih = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$raporDosya = "GuvenlikRaporu_$tarih.txt"
+
+function Yaz-Rapor {
+    param([string]$Baslik, [string]$Durum, [string]$Detay, [string]$Onerilen)
+    $satir = [PSCustomObject]@{
+        Kontrol   = $Baslik
+        Durum     = $Durum
+        Detay     = $Detay
+        Oneri     = $Onerilen
+    }
+    $global:rapor += $satir
+    $renk = if ($Durum -eq "RISKLI") { "Red" } elseif ($Durum -eq "UYARI") { "Yellow" } else { "Green" }
+    Write-Host "[$Durum] $Baslik" -ForegroundColor $renk
+    if ($Detay) { Write-Host "    -> $Detay" -ForegroundColor Gray }
+}
+
+Write-Host "`n===== WINDOWS SISTEM GUVENLIK TARAMASI BASLIYOR =====`n" -ForegroundColor Cyan
+
+# ---------- 1) Yonetici kontrolu ----------
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "UYARI: Script yonetici olarak calismiyor. Bazi kontroller/duzeltmeler calismayabilir." -ForegroundColor Yellow
+}
+
+# ---------- 2) Windows Firewall durumu ----------
+$fw = Get-NetFirewallProfile
+foreach ($profile in $fw) {
+    if ($profile.Enabled -eq $false) {
+        Yaz-Rapor "Firewall ($($profile.Name))" "RISKLI" "Guvenlik duvari kapali." "Etkinlestirilmeli."
+        if ($AutoFix) { Set-NetFirewallProfile -Profile $profile.Name -Enabled True }
+    } else {
+        Yaz-Rapor "Firewall ($($profile.Name))" "OK" "Guvenlik duvari aktif." ""
+    }
+}
+
+# ---------- 3) SMBv1 kontrolu (WannaCry vb. saldirilarin kullandigi eski protokol) ----------
+$smb1 = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol
+if ($smb1.State -eq "Enabled") {
+    Yaz-Rapor "SMBv1 Protokolu" "RISKLI" "Eski ve guvensiz SMBv1 aktif." "Kapatilmali."
+    if ($AutoFix) { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart }
+} else {
+    Yaz-Rapor "SMBv1 Protokolu" "OK" "SMBv1 kapali." ""
+}
+
+# ---------- 4) RDP (Uzak Masaustu) durumu ----------
+$rdp = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections"
+if ($rdp.fDenyTSConnections -eq 0) {
+    Yaz-Rapor "Uzak Masaustu (RDP)" "UYARI" "RDP acik. Internete dogrudan acik RDP sik saldiri hedefidir." "Gerekli degilse kapatin veya VPN arkasina alin, guclu parola + NLA kullanin."
+} else {
+    Yaz-Rapor "Uzak Masaustu (RDP)" "OK" "RDP kapali." ""
+}
+
+# ---------- 5) Acik portlar / dinleyen servisler ----------
+Write-Host "`n--- Acik Portlar (LISTENING) ---" -ForegroundColor Cyan
+$portlar = Get-NetTCPConnection -State Listen | Select-Object LocalAddress, LocalPort, OwningProcess -Unique | Sort-Object LocalPort
+foreach ($p in $portlar) {
+    $proc = (Get-Process -Id $p.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+    $riskliPortlar = @(21,23,135,139,445,3389,5900)
+    if ($riskliPortlar -contains $p.LocalPort) {
+        Yaz-Rapor "Port $($p.LocalPort) ($proc)" "UYARI" "Bilinen riskli/eski servis portu acik." "Gerekli degilse kapatin, firewall ile kisitlayin."
+    } else {
+        Yaz-Rapor "Port $($p.LocalPort) ($proc)" "BILGI" "Dinleniyor." ""
+    }
+}
+
+# ---------- 6) Windows Update durumu ----------
+Write-Host "`n--- Windows Update Kontrolu ---" -ForegroundColor Cyan
+try {
+    $updateSession = New-Object -ComObject Microsoft.Update.Session
+    $updateSearcher = $updateSession.CreateUpdateSearcher()
+    $result = $updateSearcher.Search("IsInstalled=0 and IsHidden=0")
+    if ($result.Updates.Count -gt 0) {
+        Yaz-Rapor "Windows Update" "RISKLI" "$($result.Updates.Count) adet eksik guncelleme var." "Windows Update calistirilmali."
+    } else {
+        Yaz-Rapor "Windows Update" "OK" "Sistem guncel." ""
+    }
+} catch {
+    Yaz-Rapor "Windows Update" "BILGI" "Otomatik kontrol edilemedi, manuel kontrol onerilir." ""
+}
+
+# ---------- 7) Guest hesabi ----------
+$guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+if ($guest -and $guest.Enabled) {
+    Yaz-Rapor "Guest Hesabi" "RISKLI" "Misafir hesabi aktif." "Devre disi birakilmali."
+    if ($AutoFix) { Disable-LocalUser -Name "Guest" }
+} else {
+    Yaz-Rapor "Guest Hesabi" "OK" "Misafir hesabi kapali/yok." ""
+}
+
+# ---------- 8) Parolasiz / zayif hesap kontrolu ----------
+$users = Get-LocalUser | Where-Object { $_.Enabled -eq $true }
+foreach ($u in $users) {
+    if ($u.PasswordRequired -eq $false) {
+        Yaz-Rapor "Kullanici: $($u.Name)" "RISKLI" "Parola zorunlu degil." "Parola zorunlulugu acilmali."
+    }
+}
+
+# ================= WEB SITESI GENEL KONTROLU =================
+if ($WebSiteUrl -ne "") {
+    Write-Host "`n===== WEB SITESI GUVENLIK KONTROLU: $WebSiteUrl =====`n" -ForegroundColor Cyan
+    try {
+        $req = Invoke-WebRequest -Uri $WebSiteUrl -UseBasicParsing -TimeoutSec 15
+        $headers = $req.Headers
+
+        # HTTPS kontrolu
+        if ($WebSiteUrl -notmatch "^https://") {
+            Yaz-Rapor "HTTPS" "RISKLI" "Site HTTPS kullanmiyor." "SSL sertifikasi kurulup HTTPS zorunlu hale getirilmeli."
+        } else {
+            Yaz-Rapor "HTTPS" "OK" "Site HTTPS uzerinden calisiyor." ""
+        }
+
+        # Guvenlik header kontrolleri
+        $guvenlikHeaderlari = @{
+            "Strict-Transport-Security" = "HSTS eksik. Man-in-the-middle / downgrade saldirilarina karsi ekleyin."
+            "X-Content-Type-Options"    = "X-Content-Type-Options eksik. 'nosniff' ekleyin."
+            "X-Frame-Options"           = "X-Frame-Options eksik. Clickjacking riskine karsi ekleyin."
+            "Content-Security-Policy"   = "CSP eksik. XSS riskine karsi ekleyin."
+        }
+        foreach ($h in $guvenlikHeaderlari.Keys) {
+            if (-not $headers.ContainsKey($h)) {
+                Yaz-Rapor "HTTP Header: $h" "UYARI" "Eksik." $guvenlikHeaderlari[$h]
+            } else {
+                Yaz-Rapor "HTTP Header: $h" "OK" "Mevcut." ""
+            }
+        }
+
+        # Sunucu bilgisi sizdirma kontrolu
+        if ($headers.ContainsKey("Server")) {
+            Yaz-Rapor "Server Header" "UYARI" "Sunucu/versiyon bilgisi ifsa ediliyor: $($headers['Server'])" "Sunucu bilgisini gizleyin (versiyon bilgisi saldirganlara ipucu verir)."
+        }
+        if ($headers.ContainsKey("X-Powered-By")) {
+            Yaz-Rapor "X-Powered-By Header" "UYARI" "Teknoloji bilgisi ifsa ediliyor: $($headers['X-Powered-By'])" "Bu header kaldirilmali."
+        }
+
+    } catch {
+        Yaz-Rapor "Web Sitesi Erisim" "RISKLI" "Siteye erisilemedi: $($_.Exception.Message)" "URL'yi ve sunucu erisimini kontrol edin."
+    }
+
+    # SSL sertifika bitis tarihi kontrolu
+    try {
+        $uri = [System.Uri]$WebSiteUrl
+        if ($uri.Scheme -eq "https") {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient($uri.Host, 443)
+            $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream())
+            $sslStream.AuthenticateAsClient($uri.Host)
+            $cert = $sslStream.RemoteCertificate
+            $bitisTarihi = [datetime]::Parse($cert.GetExpirationDateString())
+            $kalanGun = ($bitisTarihi - (Get-Date)).Days
+            if ($kalanGun -lt 15) {
+                Yaz-Rapor "SSL Sertifikasi" "RISKLI" "$kalanGun gun icinde sona eriyor ($bitisTarihi)." "Sertifika yenilenmeli."
+            } else {
+                Yaz-Rapor "SSL Sertifikasi" "OK" "Gecerlilik suresi: $kalanGun gun ($bitisTarihi)." ""
+            }
+            $sslStream.Close(); $tcpClient.Close()
+        }
+    } catch {
+        Yaz-Rapor "SSL Sertifikasi" "BILGI" "Sertifika bilgisi alinamadi." ""
+    }
+}
+
+# ---------- Rapor kaydet ----------
+$rapor | Format-Table -AutoSize | Out-String | Out-File -FilePath $raporDosya -Encoding UTF8
+Write-Host "`n===== TARAMA TAMAMLANDI =====" -ForegroundColor Cyan
+Write-Host "Detayli rapor kaydedildi: $raporDosya`n" -ForegroundColor Green
+
+$rapor | Group-Object Durum | Select-Object Name, Count | Format-Table -AutoSize
